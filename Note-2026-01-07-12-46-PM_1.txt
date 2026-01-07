@@ -1,0 +1,899 @@
+Note 2026-01-07 12:46 PM
+
+Create me the following codeblock entirely in vanilla javascript, return a
+single snake.js file. Have the settings be tunable configs at the top of the
+file.
+
+The concept is to create a super minimal snake game which overlays the full
+user's screen as the frame, we need to be at the top z-value on top of
+everything else.
+
+
+The game starts when we press a hot key combination.
+Use U+25A0 for the snake body with a css class to control the color.
+Use U+29BF for the food, one at a time on screen anywhere at random, that we
+need to collect.
+When we collect, extend the snake size by 1.
+Show the current SCORE in the window tab title (make sure to record what it was
+before we started and restore once we are done)
+If we hit the frame of the screen (even on window resize) or if we hit a bad guy
+(will describe later) then you lose. When you lose, the snake turns red, flash
+the snake on screen three times over 3 seconds) and then close the game. Also
+flash the score in the tab title area. Restore the original title and remove all
+instances of the game.
+Clicking ANYWHERE on screen with the mouse also exists the game.
+Arrow keys control the snake.
+Every 10 points of score increase the speed of the game slightly.
+At 10 points add a simple bad guy U+26A0 which moves in straight lines across
+the screen, could be horizontal, vertical. When they hit the edge, reverse
+course.
+At random intervals every 2-10 points add another simple bad guy.
+After 20 points the simple bad guys MAY also move diagonally. Choose at random.
+spacebar pauses/unpauses the game (show in title bar)
+save the best high score in the local browser cache along with the timestamp
+if you beat your highscore flash *NEW HIGH SCORE: #* otherwise "GAME OVER: #"
+
+
+/*
+Purpose: Fullscreen, top-z overlay Snake triggered by hotkey; click anywhere exits.
+Hot Path(s): tick() loop (movement + collisions + DOM transform updates) @ ~60–200ms.
+Big-O: O(B) per tick (B=bad guys); O(S) only on resize/spawn fallbacks (S=snake length).
+Key Trade-offs: DOM-per-entity for simplicity; tail reuse minimizes per-tick allocations.
+Tunables: SNAKE_CONFIG (hotkey, speeds, sizes, colors, storage key, flash timing).
+*/
+
+(() => {
+  'use strict';
+
+  // =========================
+  // Tunable Configs
+  // =========================
+  const SNAKE_CONFIG = {
+    // Hotkey to start game when inactive
+    START_HOTKEY: { code: 'KeyG', ctrl: true, shift: true, alt: false, meta: false },
+
+    // Grid + visuals
+    CELL_SIZE_PX: 20,
+    INIT_SNAKE_LENGTH: 6,
+    Z_INDEX: 2147483647,
+    FONT_FAMILY: 'monospace',
+    TEXT_SHADOW: '0 0 6px rgba(0,0,0,0.65)',
+
+    // Input behavior
+    ALLOW_REVERSE: false, // allow 180° direction flips
+    START_IN_INPUTS: false, // allow hotkey to start while focused in input/textarea/contenteditable
+
+    // Game speed
+    BASE_TICK_MS: 150,
+    MIN_TICK_MS: 60,
+    SPEEDUP_EVERY_POINTS: 10,
+    SPEEDUP_FACTOR: 0.92, // newTick = max(MIN_TICK_MS, round(oldTick * factor))
+
+    // Bad guys
+    BADGUY_START_SCORE: 10,
+    BADGUY_MIN_INTERVAL_POINTS: 2,
+    BADGUY_MAX_INTERVAL_POINTS: 10,
+    BADGUY_DIAGONAL_AFTER_SCORE: 20,
+    BADGUY_DIAGONAL_CHANCE: 0.5, // after DIAGONAL_AFTER_SCORE, new bad guys may be diagonal
+
+    // Game over / flashing
+    GAME_OVER_FLASH_CYCLES: 3, // 3 flashes total
+    GAME_OVER_TOTAL_MS: 3000, // 3 seconds total
+
+    // Title strings
+    TITLE_SCORE_PREFIX: 'SCORE: ',
+    TITLE_PAUSED_PREFIX: 'PAUSED | ',
+    TITLE_GAMEOVER_PREFIX: 'GAME OVER: ',
+    TITLE_NEWHIGH_PREFIX: 'NEW HIGH SCORE: ',
+
+    // Local storage for best score + timestamp
+    LOCALSTORAGE_KEY: '__snake_overlay_highscore_v1__',
+
+    // Random placement attempts before fallback scan
+    RANDOM_PLACEMENT_ATTEMPTS: 300,
+
+    // Colors (CSS-controlled via classes; injected as CSS variables)
+    COLORS: {
+      snake: '#00e676',
+      snakeDead: '#ff1744',
+      food: '#ffea00',
+      badGuy: '#ff9100',
+    },
+  };
+
+  // =========================
+  // Constants
+  // =========================
+  const CHAR_SNAKE = '\u25A0'; // ■
+  const CHAR_FOOD = '\u29BF';  // ⦿
+  const CHAR_BAD = '\u26A0';   // ⚠
+
+  const OVERLAY_ID = '__snake_overlay_root__';
+  const STYLE_ID = '__snake_overlay_style__';
+  const GLOBAL_KEY = '__VANILLA_SNAKE_OVERLAY__';
+
+  // =========================
+  // State
+  // =========================
+  const STATE = {
+    active: false,
+    paused: false,
+    ending: false,
+
+    gridW: 0,
+    gridH: 0,
+
+    dirX: 1,
+    dirY: 0,
+    nextDirX: 1,
+    nextDirY: 0,
+
+    score: 0,
+    tickMs: SNAKE_CONFIG.BASE_TICK_MS,
+
+    titleOriginal: '',
+    titleOwned: false,
+
+    bestScore: 0,
+    bestTs: 0,
+
+    overlayEl: null,
+    styleEl: null,
+
+    tickTimeoutId: 0,
+    gameOverIntervalId: 0,
+    gameOverTimeoutId: 0,
+
+    // Snake segments: head at index 0
+    snake: [], // { x, y, el }
+    // Snake occupancy counts (supports overlaps without breaking spawns)
+    snakePosCount: new Map(), // packedPos -> count
+
+    // Food
+    foodEl: null,
+    foodX: 0,
+    foodY: 0,
+    foodKey: 0,
+
+    // Bad guys
+    badGuys: [], // { x, y, dx, dy, el }
+    badPosSet: new Set(), // packedPos
+    nextBadGuyAtScore: 0,
+
+    // Listeners (installed once)
+    listenersInstalled: false,
+  };
+
+  // =========================
+  // Utilities
+  // =========================
+  function isEditableTarget(target) {
+    if (!target || typeof target !== 'object') return false;
+    const el = target;
+    if (el.isContentEditable) return true;
+    const tag = (el.tagName || '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    return false;
+  }
+
+  function randInt(min, max) {
+    // inclusive
+    return (min + Math.floor(Math.random() * (max - min + 1))) | 0;
+  }
+
+  function clampInt(v, min, max) {
+    if (v < min) return min;
+    if (v > max) return max;
+    return v;
+  }
+
+  function packPos(x, y) {
+    // Unique for x,y in [0..65535]; viewport grids are far smaller.
+    return ((y & 0xffff) << 16) | (x & 0xffff);
+  }
+
+  function setTransform(el, x, y) {
+    el.style.transform = `translate3d(${x * SNAKE_CONFIG.CELL_SIZE_PX}px, ${y * SNAKE_CONFIG.CELL_SIZE_PX}px, 0)`;
+  }
+
+  function computeGrid() {
+    const cell = SNAKE_CONFIG.CELL_SIZE_PX;
+    const w = Math.max(2, (window.innerWidth / cell) | 0);
+    const h = Math.max(2, (window.innerHeight / cell) | 0);
+    STATE.gridW = w;
+    STATE.gridH = h;
+  }
+
+  function loadBestScore() {
+    STATE.bestScore = 0;
+    STATE.bestTs = 0;
+    try {
+      const raw = localStorage.getItem(SNAKE_CONFIG.LOCALSTORAGE_KEY);
+      if (!raw) return;
+      const obj = JSON.parse(raw);
+      const score = (obj && typeof obj.score === 'number') ? (obj.score | 0) : 0;
+      const ts = (obj && typeof obj.ts === 'number') ? obj.ts : 0;
+      if (score > 0) {
+        STATE.bestScore = score;
+        STATE.bestTs = ts;
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function saveBestScore(score) {
+    try {
+      const payload = { score: score | 0, ts: Date.now() };
+      localStorage.setItem(SNAKE_CONFIG.LOCALSTORAGE_KEY, JSON.stringify(payload));
+      STATE.bestScore = payload.score;
+      STATE.bestTs = payload.ts;
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function hotkeyMatches(e) {
+    const hk = SNAKE_CONFIG.START_HOTKEY;
+    if (hk.code && e.code !== hk.code) return false;
+    if (!!hk.ctrl !== !!e.ctrlKey) return false;
+    if (!!hk.shift !== !!e.shiftKey) return false;
+    if (!!hk.alt !== !!e.altKey) return false;
+    if (!!hk.meta !== !!e.metaKey) return false;
+    return true;
+  }
+
+  // =========================
+  // DOM + Styling
+  // =========================
+  function ensureStyleEl() {
+    if (STATE.styleEl && document.contains(STATE.styleEl)) return;
+
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+
+    const c = SNAKE_CONFIG.COLORS;
+    style.textContent = `
+      #${OVERLAY_ID} {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        z-index: ${SNAKE_CONFIG.Z_INDEX};
+        pointer-events: auto;
+        background: transparent;
+        overflow: hidden;
+        user-select: none;
+        -webkit-user-select: none;
+        font-family: ${cssString(SNAKE_CONFIG.FONT_FAMILY)};
+        font-size: ${SNAKE_CONFIG.CELL_SIZE_PX}px;
+        line-height: ${SNAKE_CONFIG.CELL_SIZE_PX}px;
+        text-shadow: ${cssString(SNAKE_CONFIG.TEXT_SHADOW)};
+        contain: layout style paint;
+        isolation: isolate;
+      }
+      #${OVERLAY_ID} .snake__entity {
+        position: absolute;
+        left: 0;
+        top: 0;
+        will-change: transform;
+        user-select: none;
+        -webkit-user-select: none;
+        pointer-events: none;
+      }
+      #${OVERLAY_ID} .snake__cell { color: ${cssString(c.snake)}; }
+      #${OVERLAY_ID}.snake--dead .snake__cell { color: ${cssString(c.snakeDead)}; }
+
+      #${OVERLAY_ID} .snake__food { color: ${cssString(c.food)}; }
+      #${OVERLAY_ID} .snake__bad  { color: ${cssString(c.badGuy)}; }
+
+      /* Flash only the snake (not food / bad guys) */
+      #${OVERLAY_ID}.snake--flash-off .snake__cell { opacity: 0; }
+    `;
+
+    const parent = document.head || document.documentElement;
+    parent.appendChild(style);
+    STATE.styleEl = style;
+  }
+
+  function cssString(v) {
+    // Minimal escaping for CSS string contexts used above.
+    return String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  }
+
+  function createOverlay() {
+    if (STATE.overlayEl && document.contains(STATE.overlayEl)) return;
+
+    ensureStyleEl();
+
+    const overlay = document.createElement('div');
+    overlay.id = OVERLAY_ID;
+    overlay.setAttribute('aria-hidden', 'true');
+
+    const parent = document.body || document.documentElement;
+    parent.appendChild(overlay);
+
+    STATE.overlayEl = overlay;
+  }
+
+  function removeOverlay() {
+    if (STATE.overlayEl && STATE.overlayEl.parentNode) {
+      STATE.overlayEl.parentNode.removeChild(STATE.overlayEl);
+    }
+    STATE.overlayEl = null;
+
+    if (STATE.styleEl && STATE.styleEl.parentNode) {
+      STATE.styleEl.parentNode.removeChild(STATE.styleEl);
+    }
+    STATE.styleEl = null;
+  }
+
+  function createEntity(char, className) {
+    const el = document.createElement('span');
+    el.className = `snake__entity ${className}`;
+    el.textContent = char;
+    STATE.overlayEl.appendChild(el);
+    return el;
+  }
+
+  // =========================
+  // Title Management
+  // =========================
+  function updateTitleScore() {
+    if (!STATE.active || STATE.ending) return;
+    const scoreStr = `${SNAKE_CONFIG.TITLE_SCORE_PREFIX}${STATE.score}`;
+    document.title = STATE.paused ? `${SNAKE_CONFIG.TITLE_PAUSED_PREFIX}${scoreStr}` : scoreStr;
+  }
+
+  function restoreTitle() {
+    if (!STATE.titleOwned) return;
+    document.title = STATE.titleOriginal;
+    STATE.titleOwned = false;
+  }
+
+  // =========================
+  // Placement Helpers
+  // =========================
+  function isCellOccupied(key) {
+    if (STATE.snakePosCount.has(key)) return true;
+    if (STATE.badPosSet.has(key)) return true;
+    return false;
+  }
+
+  function pickRandomEmptyCell(excludeFood) {
+    const w = STATE.gridW;
+    const h = STATE.gridH;
+    const maxAttempts = Math.min(SNAKE_CONFIG.RANDOM_PLACEMENT_ATTEMPTS, w * h);
+
+    for (let i = 0; i < maxAttempts; i++) {
+      const x = randInt(0, w - 1);
+      const y = randInt(0, h - 1);
+      const key = packPos(x, y);
+      if (excludeFood && key === STATE.foodKey) continue;
+      if (!isCellOccupied(key)) return { x, y, key };
+    }
+
+    // Fallback deterministic scan
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const key = packPos(x, y);
+        if (excludeFood && key === STATE.foodKey) continue;
+        if (!isCellOccupied(key)) return { x, y, key };
+      }
+    }
+
+    // Extremely unlikely unless the board is fully occupied
+    return { x: 0, y: 0, key: packPos(0, 0) };
+  }
+
+  // =========================
+  // Snake + Entities
+  // =========================
+  function snakePosInc(key) {
+    const prev = STATE.snakePosCount.get(key) | 0;
+    STATE.snakePosCount.set(key, prev + 1);
+  }
+
+  function snakePosDec(key) {
+    const prev = STATE.snakePosCount.get(key) | 0;
+    if (prev <= 1) STATE.snakePosCount.delete(key);
+    else STATE.snakePosCount.set(key, prev - 1);
+  }
+
+  function initSnake() {
+    STATE.snake.length = 0;
+    STATE.snakePosCount.clear();
+
+    const w = STATE.gridW;
+    const h = STATE.gridH;
+
+    const maxLen = Math.max(2, Math.min(SNAKE_CONFIG.INIT_SNAKE_LENGTH | 0, w - 1));
+    const headX = clampInt((w / 2) | 0, 1, w - 1);
+    const headY = clampInt((h / 2) | 0, 0, h - 1);
+
+    // Default direction: right; body extends left.
+    STATE.dirX = 1;
+    STATE.dirY = 0;
+    STATE.nextDirX = 1;
+    STATE.nextDirY = 0;
+
+    for (let i = 0; i < maxLen; i++) {
+      const x = headX - i;
+      const y = headY;
+      const el = createEntity(CHAR_SNAKE, 'snake__cell');
+      setTransform(el, x, y);
+      STATE.snake.push({ x, y, el });
+      snakePosInc(packPos(x, y));
+    }
+  }
+
+  function ensureFood() {
+    if (!STATE.foodEl) {
+      STATE.foodEl = createEntity(CHAR_FOOD, 'snake__food');
+    }
+  }
+
+  function spawnFood() {
+    ensureFood();
+    const p = pickRandomEmptyCell(false);
+    STATE.foodX = p.x;
+    STATE.foodY = p.y;
+    STATE.foodKey = p.key;
+    setTransform(STATE.foodEl, p.x, p.y);
+  }
+
+  function rebuildBadPosSet() {
+    STATE.badPosSet.clear();
+    for (let i = 0; i < STATE.badGuys.length; i++) {
+      const b = STATE.badGuys[i];
+      STATE.badPosSet.add(packPos(b.x, b.y));
+    }
+  }
+
+  function addBadGuy() {
+    const p = pickRandomEmptyCell(true);
+
+    let dx = 0;
+    let dy = 0;
+
+    const score = STATE.score | 0;
+    const diagonalAllowed = score >= (SNAKE_CONFIG.BADGUY_DIAGONAL_AFTER_SCORE | 0);
+    const doDiagonal = diagonalAllowed && (Math.random() < SNAKE_CONFIG.BADGUY_DIAGONAL_CHANCE);
+
+    if (doDiagonal) {
+      dx = Math.random() < 0.5 ? -1 : 1;
+      dy = Math.random() < 0.5 ? -1 : 1;
+    } else {
+      // Horizontal or vertical
+      if (Math.random() < 0.5) {
+        dx = Math.random() < 0.5 ? -1 : 1;
+        dy = 0;
+      } else {
+        dx = 0;
+        dy = Math.random() < 0.5 ? -1 : 1;
+      }
+    }
+
+    const el = createEntity(CHAR_BAD, 'snake__bad');
+    setTransform(el, p.x, p.y);
+
+    STATE.badGuys.push({ x: p.x, y: p.y, dx, dy, el });
+    rebuildBadPosSet();
+  }
+
+  function scheduleNextBadGuy() {
+    const min = SNAKE_CONFIG.BADGUY_MIN_INTERVAL_POINTS | 0;
+    const max = SNAKE_CONFIG.BADGUY_MAX_INTERVAL_POINTS | 0;
+    const delta = randInt(min, max);
+    STATE.nextBadGuyAtScore = (STATE.score | 0) + delta;
+  }
+
+  function onScoreChanged() {
+    // Speed up every N points
+    const every = SNAKE_CONFIG.SPEEDUP_EVERY_POINTS | 0;
+    if (every > 0 && (STATE.score % every) === 0) {
+      const next = Math.max(SNAKE_CONFIG.MIN_TICK_MS | 0, Math.round(STATE.tickMs * SNAKE_CONFIG.SPEEDUP_FACTOR));
+      STATE.tickMs = next;
+    }
+
+    // Bad guy logic
+    const startAt = SNAKE_CONFIG.BADGUY_START_SCORE | 0;
+
+    if (STATE.score === startAt) {
+      // First bad guy: must be horizontal/vertical per spec.
+      // (Diagonal chance only kicks in for newly spawned after score>=BADGUY_DIAGONAL_AFTER_SCORE.)
+      addBadGuy();
+      scheduleNextBadGuy();
+    } else if (STATE.score > startAt && STATE.score >= (STATE.nextBadGuyAtScore | 0)) {
+      addBadGuy();
+      scheduleNextBadGuy();
+    }
+
+    updateTitleScore();
+  }
+
+  // =========================
+  // Movement + Collisions
+  // =========================
+  function setDirection(dx, dy) {
+    if (!SNAKE_CONFIG.ALLOW_REVERSE) {
+      if ((STATE.dirX === -dx) && (STATE.dirY === -dy)) return;
+    }
+    STATE.nextDirX = dx;
+    STATE.nextDirY = dy;
+  }
+
+  function moveBadGuys() {
+    const w = STATE.gridW;
+    const h = STATE.gridH;
+
+    for (let i = 0; i < STATE.badGuys.length; i++) {
+      const b = STATE.badGuys[i];
+
+      let nx = b.x + b.dx;
+      let ny = b.y + b.dy;
+
+      if (nx < 0 || nx >= w) {
+        b.dx = -b.dx;
+        nx = b.x + b.dx;
+      }
+      if (ny < 0 || ny >= h) {
+        b.dy = -b.dy;
+        ny = b.y + b.dy;
+      }
+
+      // Clamp hard in case of extreme resize
+      b.x = clampInt(nx, 0, w - 1);
+      b.y = clampInt(ny, 0, h - 1);
+
+      setTransform(b.el, b.x, b.y);
+    }
+
+    rebuildBadPosSet();
+  }
+
+  function tick() {
+    STATE.tickTimeoutId = 0;
+    if (!STATE.active || STATE.paused || STATE.ending) return;
+
+    // Apply pending direction once per tick
+    STATE.dirX = STATE.nextDirX;
+    STATE.dirY = STATE.nextDirY;
+
+    const head = STATE.snake[0];
+    const newX = (head.x + STATE.dirX) | 0;
+    const newY = (head.y + STATE.dirY) | 0;
+
+    // Frame collision
+    if (newX < 0 || newY < 0 || newX >= STATE.gridW || newY >= STATE.gridH) {
+      loseGame('frame');
+      return;
+    }
+
+    const newHeadKey = packPos(newX, newY);
+
+    // Bad guy collision (pre-move)
+    if (STATE.badPosSet.has(newHeadKey)) {
+      loseGame('badguy');
+      return;
+    }
+
+    const ate = (newHeadKey === STATE.foodKey);
+
+    if (ate) {
+      // Grow: add a new head segment element
+      const el = createEntity(CHAR_SNAKE, 'snake__cell');
+      setTransform(el, newX, newY);
+      STATE.snake.unshift({ x: newX, y: newY, el });
+      snakePosInc(newHeadKey);
+
+      STATE.score = (STATE.score + 1) | 0;
+      onScoreChanged();
+
+      spawnFood();
+    } else {
+      // Move: recycle tail to new head to minimize allocations
+      const tail = STATE.snake.pop();
+      const tailOldKey = packPos(tail.x, tail.y);
+
+      snakePosDec(tailOldKey);
+
+      tail.x = newX;
+      tail.y = newY;
+      setTransform(tail.el, newX, newY);
+
+      STATE.snake.unshift(tail);
+      snakePosInc(newHeadKey);
+    }
+
+    // Move bad guys (post-move) then re-check collision
+    if (STATE.badGuys.length) {
+      moveBadGuys();
+      if (STATE.badPosSet.has(newHeadKey)) {
+        loseGame('badguy');
+        return;
+      }
+    }
+
+    scheduleTick();
+  }
+
+  function scheduleTick() {
+    if (!STATE.active || STATE.paused || STATE.ending) return;
+    if (STATE.tickTimeoutId) clearTimeout(STATE.tickTimeoutId);
+    STATE.tickTimeoutId = setTimeout(tick, STATE.tickMs);
+  }
+
+  // =========================
+  // Resize Handling
+  // =========================
+  function handleResize() {
+    if (!STATE.active || STATE.ending) return;
+
+    computeGrid();
+
+    // If any snake segment is out of bounds after resize -> lose (per spec)
+    for (let i = 0; i < STATE.snake.length; i++) {
+      const s = STATE.snake[i];
+      if (s.x < 0 || s.y < 0 || s.x >= STATE.gridW || s.y >= STATE.gridH) {
+        loseGame('resize');
+        return;
+      }
+    }
+
+    // If food out of bounds, respawn it
+    if (STATE.foodX < 0 || STATE.foodY < 0 || STATE.foodX >= STATE.gridW || STATE.foodY >= STATE.gridH) {
+      spawnFood();
+    }
+
+    // Clamp bad guys inside new bounds + reverse direction if needed
+    const w = STATE.gridW;
+    const h = STATE.gridH;
+    for (let i = 0; i < STATE.badGuys.length; i++) {
+      const b = STATE.badGuys[i];
+      let changed = false;
+
+      if (b.x >= w) { b.x = w - 1; b.dx = -b.dx; changed = true; }
+      if (b.y >= h) { b.y = h - 1; b.dy = -b.dy; changed = true; }
+      if (b.x < 0)  { b.x = 0;     b.dx = -b.dx; changed = true; }
+      if (b.y < 0)  { b.y = 0;     b.dy = -b.dy; changed = true; }
+
+      if (changed) setTransform(b.el, b.x, b.y);
+    }
+    rebuildBadPosSet();
+  }
+
+  // =========================
+  // Game Lifecycle
+  // =========================
+  function startGame() {
+    if (STATE.active || STATE.ending) return;
+
+    computeGrid();
+    createOverlay();
+
+    // Capture title at start (and restore on exit)
+    STATE.titleOriginal = document.title;
+    STATE.titleOwned = true;
+
+    loadBestScore();
+
+    // Reset state
+    STATE.active = true;
+    STATE.paused = false;
+    STATE.ending = false;
+
+    STATE.score = 0;
+    STATE.tickMs = SNAKE_CONFIG.BASE_TICK_MS;
+
+    STATE.nextBadGuyAtScore = 0;
+
+    // Clean overlay contents (in case)
+    STATE.overlayEl.classList.remove('snake--dead', 'snake--flash-off');
+    STATE.overlayEl.textContent = '';
+
+    // Reset entities
+    STATE.snake.length = 0;
+    STATE.snakePosCount.clear();
+
+    STATE.badGuys.length = 0;
+    STATE.badPosSet.clear();
+
+    STATE.foodEl = null;
+    STATE.foodX = 0;
+    STATE.foodY = 0;
+    STATE.foodKey = packPos(0, 0);
+
+    initSnake();
+    spawnFood();
+
+    updateTitleScore();
+    scheduleTick();
+  }
+
+  function stopGameImmediate() {
+    // Non-loss exit (mouse click)
+    if (!STATE.active && !STATE.ending) return;
+
+    STATE.active = false;
+    STATE.paused = false;
+    STATE.ending = false;
+
+    if (STATE.tickTimeoutId) {
+      clearTimeout(STATE.tickTimeoutId);
+      STATE.tickTimeoutId = 0;
+    }
+    if (STATE.gameOverIntervalId) {
+      clearInterval(STATE.gameOverIntervalId);
+      STATE.gameOverIntervalId = 0;
+    }
+    if (STATE.gameOverTimeoutId) {
+      clearTimeout(STATE.gameOverTimeoutId);
+      STATE.gameOverTimeoutId = 0;
+    }
+
+    removeOverlay();
+    restoreTitle();
+
+    // Drop references
+    STATE.snake.length = 0;
+    STATE.snakePosCount.clear();
+    STATE.badGuys.length = 0;
+    STATE.badPosSet.clear();
+    STATE.foodEl = null;
+  }
+
+  function loseGame(reason) {
+    if (!STATE.active || STATE.ending) return;
+
+    STATE.ending = true;
+    STATE.active = false;
+
+    if (STATE.tickTimeoutId) {
+      clearTimeout(STATE.tickTimeoutId);
+      STATE.tickTimeoutId = 0;
+    }
+
+    const finalScore = STATE.score | 0;
+
+    const wasHigh = (finalScore > (STATE.bestScore | 0));
+    if (wasHigh) saveBestScore(finalScore);
+
+    const msg = wasHigh
+      ? `${SNAKE_CONFIG.TITLE_NEWHIGH_PREFIX}${finalScore}`
+      : `${SNAKE_CONFIG.TITLE_GAMEOVER_PREFIX}${finalScore}`;
+
+    // Turn snake red
+    if (STATE.overlayEl) STATE.overlayEl.classList.add('snake--dead');
+
+    // Flash snake 3 times over 3 seconds + flash title
+    const cycles = Math.max(1, SNAKE_CONFIG.GAME_OVER_FLASH_CYCLES | 0);
+    const totalMs = Math.max(300, SNAKE_CONFIG.GAME_OVER_TOTAL_MS | 0);
+    const toggles = cycles * 2;
+    const intervalMs = Math.max(50, Math.round(totalMs / toggles));
+
+    let tickCount = 0;
+    let visible = true;
+
+    // Start with message visible
+    document.title = msg;
+
+    STATE.gameOverIntervalId = setInterval(() => {
+      tickCount++;
+
+      visible = !visible;
+      if (STATE.overlayEl) {
+        if (visible) STATE.overlayEl.classList.remove('snake--flash-off');
+        else STATE.overlayEl.classList.add('snake--flash-off');
+      }
+
+      document.title = visible ? msg : STATE.titleOriginal;
+
+      if (tickCount >= toggles) {
+        clearInterval(STATE.gameOverIntervalId);
+        STATE.gameOverIntervalId = 0;
+
+        STATE.gameOverTimeoutId = setTimeout(() => {
+          STATE.gameOverTimeoutId = 0;
+          stopGameImmediate();
+        }, 0);
+      }
+    }, intervalMs);
+  }
+
+  // =========================
+  // Input Handlers
+  // =========================
+  function handleKeydown(e) {
+    // Start hotkey when inactive
+    if (!STATE.active && !STATE.ending) {
+      if (!SNAKE_CONFIG.START_IN_INPUTS && isEditableTarget(e.target)) return;
+      if (!hotkeyMatches(e)) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      startGame();
+      return;
+    }
+
+    if (!STATE.active || STATE.ending) return;
+
+    // While active: control snake, pause
+    const code = e.code;
+
+    if (code === 'Space') {
+      e.preventDefault();
+      e.stopPropagation();
+      STATE.paused = !STATE.paused;
+      updateTitleScore();
+      if (!STATE.paused) scheduleTick();
+      return;
+    }
+
+    // Movement keys
+    if (code === 'ArrowUp' || code === 'ArrowDown' || code === 'ArrowLeft' || code === 'ArrowRight') {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (code === 'ArrowUp') setDirection(0, -1);
+      else if (code === 'ArrowDown') setDirection(0, 1);
+      else if (code === 'ArrowLeft') setDirection(-1, 0);
+      else setDirection(1, 0);
+      return;
+    }
+  }
+
+  function handlePointerDown(e) {
+    if (!STATE.active || STATE.ending) return;
+    // Clicking ANYWHERE exits immediately
+    e.preventDefault();
+    e.stopPropagation();
+    stopGameImmediate();
+  }
+
+  // =========================
+  // Installation / Exposure
+  // =========================
+  function installListenersOnce() {
+    if (STATE.listenersInstalled) return;
+    STATE.listenersInstalled = true;
+
+    window.addEventListener('keydown', handleKeydown, { capture: true, passive: false });
+    window.addEventListener('resize', handleResize, { passive: true });
+
+    // Pointer exit (capture to catch “anywhere”)
+    window.addEventListener('mousedown', handlePointerDown, { capture: true, passive: false });
+    window.addEventListener('touchstart', handlePointerDown, { capture: true, passive: false });
+  }
+
+  function destroyController() {
+    // Full teardown (also removes the hotkey controller)
+    stopGameImmediate();
+
+    if (STATE.listenersInstalled) {
+      STATE.listenersInstalled = false;
+      window.removeEventListener('keydown', handleKeydown, { capture: true });
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('mousedown', handlePointerDown, { capture: true });
+      window.removeEventListener('touchstart', handlePointerDown, { capture: true });
+    }
+  }
+
+  // Avoid duplicate controllers if injected multiple times
+  try {
+    const prev = window[GLOBAL_KEY];
+    if (prev && typeof prev.destroy === 'function') prev.destroy();
+  } catch (_) {
+    // ignore
+  }
+
+  installListenersOnce();
+
+  // Optional control surface (non-invasive)
+  window[GLOBAL_KEY] = {
+    start: startGame,
+    stop: stopGameImmediate,
+    destroy: destroyController,
+    config: SNAKE_CONFIG,
+  };
+})();
